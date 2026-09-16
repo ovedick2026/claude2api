@@ -126,11 +126,52 @@ func (claudeAI *ClaudeAI) GetUserInfo() (*UserInfo, error) {
 	}
 
 	info := &UserInfo{Email: acct.EmailAddress}
-	if len(acct.Memberships) > 0 {
-		info.OrgUUID = acct.Memberships[0].Organization.UUID
-		claudeAI.orgUUID = info.OrgUUID
+	// 修复：多组织账号需选取 /api/organizations 中 capabilities 含 "chat" 的组织 uuid
+	orgUUID, orgErr := claudeAI.fetchChatOrgUUID()
+	if orgErr != nil {
+		return nil, orgErr
 	}
+	info.OrgUUID = orgUUID
+	claudeAI.orgUUID = orgUUID
 	return info, nil
+}
+
+// fetchChatOrgUUID 查询组织列表，返回 capabilities 数组包含 "chat" 的第一个组织 uuid。
+func (claudeAI *ClaudeAI) fetchChatOrgUUID() (string, error) {
+	req, err := claudeAI.request(fhttp.MethodGet, claudeAIBaseURL+"/api/organizations", nil)
+	if err != nil {
+		return "", fmt.Errorf("构造请求失败: %w", err)
+	}
+	resp, err := claudeAI.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("查询组织列表失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取组织列表响应失败: %w", err)
+	}
+	slog.Debug("[ClaudeAI] fetchChatOrgUUID 响应", "status", resp.StatusCode, "body", utils.Truncate(string(body), 500))
+	if resp.StatusCode != fhttp.StatusOK {
+		return "", fmt.Errorf("查询组织列表 HTTP %d: %s", resp.StatusCode, utils.Truncate(string(body), 200))
+	}
+
+	var orgs []struct {
+		UUID         string   `json:"uuid"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(body, &orgs); err != nil {
+		return "", fmt.Errorf("解析组织列表失败: %w", err)
+	}
+	for _, org := range orgs {
+		for _, capability := range org.Capabilities {
+			if capability == "chat" {
+				return org.UUID, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("组织列表中没有 capabilities 含 chat 的组织（共 %d 个）", len(orgs))
 }
 
 // UploadFile 将适配层准备好的 Base64 图片上传到 Claude.ai。

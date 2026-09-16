@@ -142,6 +142,8 @@ function statusCounts() {
     active: 0,
     expired: 0,
     error: 0,
+    cooldown: 0,
+    disabled: 0,
     unknown: 0,
   };
   for (const a of ACCOUNTS) {
@@ -158,9 +160,11 @@ function renderStats() {
     `<span>账号 <b>${c.all}</b></span>` +
     `<span>正常 <b>${c.active}</b></span>` +
     `<span>失效 <b>${c.expired}</b></span>` +
-    `<span>错误 <b>${c.error}</b></span>`;
+    `<span>错误 <b>${c.error}</b></span>` +
+    `<span>冷却 <b>${c.cooldown}</b></span>` +
+    `<span>禁用 <b>${c.disabled}</b></span>`;
 
-  for (const k of ["all", "active", "expired", "error", "unknown"]) {
+  for (const k of ["all", "active", "expired", "error", "cooldown", "disabled", "unknown"]) {
     const el = $("#cnt-" + k);
     if (el) el.textContent = c[k];
   }
@@ -173,9 +177,38 @@ function statusBadge(status) {
       active: "正常",
       expired: "已失效",
       error: "错误",
+      cooldown: "冷却中",
+      disabled: "已禁用",
       unknown: "未查询",
     }[status] || status;
   return `<span class="badge ${status}">${esc(label)}</span>`;
+}
+
+function fmtCountdown(t) {
+  if (!t) return "";
+  const ms = Date.parse(t);
+  if (isNaN(ms)) return "";
+  let sec = Math.floor((ms - Date.now()) / 1000);
+  if (sec <= 0) return "";
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (d > 0) return `${d}天${h}小时`;
+  if (h > 0) return `${h}小时${m}分`;
+  if (m > 0) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
+function statusCell(a) {
+  let html = statusBadge(a.status);
+  if (statusOf(a) === "cooldown" && a.disabled_until) {
+    html +=
+      ` <span class="cd-count" data-cd="${esc(a.disabled_until)}">` +
+      (esc(fmtCountdown(a.disabled_until)) || "即将恢复") +
+      `</span>`;
+  }
+  return html;
 }
 
 function fmtTime(t) {
@@ -236,7 +269,7 @@ function renderTable() {
     .map((a, i) => `<tr data-email="${esc(a.email)}">
       <td>${start + i + 1}</td>
       <td class="mono">${esc(a.email)}</td>
-      <td>${statusBadge(a.status)}</td>
+      <td>${statusCell(a)}</td>
       <td class="mono">${esc(fmtTime(a.created_at) || "—")}</td>
       <td>${esc(fmtSurvived(a.created_at))}</td>
       <td class="mono">${esc(fmtTime(a.updated_at) || "—")}</td>
@@ -459,19 +492,35 @@ async function deleteExpired() {
 function openDetail(email) {
   const a = ACCOUNTS.find((x) => x.email === email);
   if (!a) return;
+  const statusLabels = {
+    active: "正常",
+    expired: "已失效",
+    error: "错误",
+    cooldown: "冷却中",
+    disabled: "已禁用",
+    unknown: "未查询",
+  };
+  const reasonText =
+    a.disable_reason === "rate_limit"
+      ? "限流冷却（到期自动恢复）"
+      : a.disable_reason
+        ? "错误：" + a.disable_reason
+        : "—";
   const rows = [
     ["邮箱", a.email],
-    [
-      "状态",
-      { active: "正常", expired: "已失效", error: "错误", unknown: "未查询" }[
-        a.status || "unknown"
-      ] || a.status,
-    ],
+    ["状态", statusLabels[a.status || "unknown"] || a.status],
+    a.status === "cooldown" && a.disabled_until
+      ? [
+          "冷却截止",
+          `${fmtTime(a.disabled_until)}（剩余 ${fmtCountdown(a.disabled_until) || "即将恢复"}）`,
+        ]
+      : null,
+    ["禁用原因", reasonText],
     ["组织 UUID", a.org_uuid || "—"],
     ["创建时间", fmtTime(a.created_at) || "—"],
     ["已存活", fmtSurvived(a.created_at)],
     ["更新时间", fmtTime(a.updated_at) || "—"],
-  ];
+  ].filter(Boolean);
 
   const info = rows
     .map(
@@ -979,6 +1028,25 @@ for (const id of ["#btn-import-cancel", "#import-close"]) {
 $("#import-mask").addEventListener("click", (e) => {
   if (e.target === $("#import-mask")) $("#import-mask").classList.add("hidden");
 });
+// 冷却倒计时每秒刷新，到期后自动重新拉取账号列表（后端会自动恢复为 active）。
+let cdReloading = false;
+setInterval(() => {
+  document.querySelectorAll(".cd-count[data-cd]").forEach((el) => {
+    const left = fmtCountdown(el.dataset.cd);
+    if (left) {
+      el.textContent = left;
+    } else if (!cdReloading) {
+      cdReloading = true;
+      el.textContent = "恢复中…";
+      loadAccounts().finally(() => {
+        setTimeout(() => {
+          cdReloading = false;
+        }, 3000);
+      });
+    }
+  });
+}, 1000);
+
 $("#btn-del-expired").addEventListener("click", deleteExpired);
 $("#btn-cfg-save").addEventListener("click", saveConfig);
 $("#btn-logout").addEventListener("click", logout);

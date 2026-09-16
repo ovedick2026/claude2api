@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	apiIndex     int
+	stickyEmail  string // 粘性调度：当前持续使用的账号邮箱，直至其限流或报错不可用才切换下一个
 	apiIndexLock sync.Mutex
 	apiClients   = map[string]*accountClient{}
 )
@@ -36,31 +36,58 @@ func clientFor(acct *repository.Account, proxy string) *accountClient {
 	return client
 }
 
-// pickAPIAccount 轮询可用账号。
+// pickAPIAccount 依次使用（粘性调度）：按固定顺序持续使用当前账号，直至其限流或报错不可用，再切换到顺序中的下一个可用账号并循环。
 func pickAPIAccount() *repository.Account {
 	accounts := repository.LoadAccounts()
-	usable := make([]repository.Account, 0, len(accounts))
-	active := map[string]bool{}
+	byEmail := make(map[string]repository.Account, len(accounts))
+	order := make([]string, 0, len(accounts))
+	usable := map[string]bool{}
 	for i := range accounts {
+		byEmail[accounts[i].Email] = accounts[i]
+		order = append(order, accounts[i].Email)
 		if AccountUsable(&accounts[i]) {
-			usable = append(usable, accounts[i])
-			active[accounts[i].Email] = true
+			usable[accounts[i].Email] = true
 		}
 	}
 	apiIndexLock.Lock()
+	defer apiIndexLock.Unlock()
 	for email := range apiClients {
-		if !active[email] {
+		if !usable[email] {
 			delete(apiClients, email)
 		}
 	}
 	if len(usable) == 0 {
-		apiIndexLock.Unlock()
+		stickyEmail = ""
 		return nil
 	}
-	acct := usable[apiIndex%len(usable)]
-	apiIndex++
-	apiIndexLock.Unlock()
-	return &acct
+	// 当前账号仍可用：继续粘性使用，不轮询。
+	if stickyEmail != "" && usable[stickyEmail] {
+		acct := byEmail[stickyEmail]
+		return &acct
+	}
+	// 从上一个使用位置的下一个开始，按固定顺序找第一个可用账号（到尾部则循环回开头）。
+	start := 0
+	if stickyEmail != "" {
+		for i, email := range order {
+			if email == stickyEmail {
+				start = i + 1
+				break
+			}
+		}
+	}
+	for off := 0; off < len(order); off++ {
+		email := order[(start+off)%len(order)]
+		if usable[email] {
+			if stickyEmail != "" {
+				slog.Info("[API] 当前账号不可用，切换到下一个账号", "from", stickyEmail, "to", email)
+			}
+			stickyEmail = email
+			acct := byEmail[email]
+			return &acct
+		}
+	}
+	stickyEmail = ""
+	return nil
 }
 
 // delConvSem 限制后台删会话并发。
@@ -150,8 +177,11 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			if s.RemoveInvalidAccount && strings.Contains(err.Error(), "account_session_invalid") {
 				repository.DeleteAccount(email)
 				slog.Warn("[API] 会话失效，已立即移除账号", "email", email)
+			} else {
+				// 请求失败自动禁用：限流进入冷却倒计时（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
+				HandleRequestFailure(email, err, 0)
 			}
-			slog.Warn("[API] 建会话失败，换号重试", "email", email, "err", err)
+			slog.Warn("[API] 建会话失败，切换账号重试", "email", email, "err", err)
 			lease.Unlock()
 			continue
 		}
@@ -182,6 +212,8 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			return res, nil
 		}
 		lastErr = err
+		// 请求失败自动禁用：限流（429 或 rate limit exceeded）进入冷却倒计时，其他错误禁用且不自动恢复。
+		HandleRequestFailure(email, err, code)
 		if emitted {
 			slog.Warn("[API] 流式输出中途失败，已输出部分内容，不再重试", "email", email, "err", err)
 			return res, &CompletionError{StatusCode: code, Err: fmt.Errorf("流式输出中断: %w", err)}
