@@ -3,6 +3,8 @@ package service
 import (
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -37,7 +39,8 @@ func clientFor(acct *repository.Account, proxy string) *accountClient {
 }
 
 // pickAPIAccount 依次使用（粘性调度）：按固定顺序持续使用当前账号，直至其限流或报错不可用，再切换到顺序中的下一个可用账号并循环。
-func pickAPIAccount() *repository.Account {
+// exclude 为本次请求内已失败过的账号，确保失败（如429限流）后必定切换到下一个账号。
+func pickAPIAccount(exclude map[string]bool) *repository.Account {
 	accounts := repository.LoadAccounts()
 	byEmail := make(map[string]repository.Account, len(accounts))
 	order := make([]string, 0, len(accounts))
@@ -61,7 +64,7 @@ func pickAPIAccount() *repository.Account {
 		return nil
 	}
 	// 当前账号仍可用：继续粘性使用，不轮询。
-	if stickyEmail != "" && usable[stickyEmail] {
+	if stickyEmail != "" && usable[stickyEmail] && !exclude[stickyEmail] {
 		acct := byEmail[stickyEmail]
 		return &acct
 	}
@@ -77,7 +80,7 @@ func pickAPIAccount() *repository.Account {
 	}
 	for off := 0; off < len(order); off++ {
 		email := order[(start+off)%len(order)]
-		if usable[email] {
+		if usable[email] && !exclude[email] {
 			if stickyEmail != "" {
 				slog.Info("[API] 当前账号不可用，切换到下一个账号", "from", stickyEmail, "to", email)
 			}
@@ -88,6 +91,21 @@ func pickAPIAccount() *repository.Account {
 	}
 	stickyEmail = ""
 	return nil
+}
+
+var httpStatusRe = regexp.MustCompile(`HTTP (\d{3})`)
+
+// httpStatusOfErr 从错误文本提取 HTTP 状态码（如 "创建会话 HTTP 429: ..."），无则返回 0。
+func httpStatusOfErr(err error) int {
+	if err == nil {
+		return 0
+	}
+	m := httpStatusRe.FindStringSubmatch(err.Error())
+	if len(m) < 2 {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
 }
 
 // delConvSem 限制后台删会话并发。
@@ -101,6 +119,10 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 	var res CompletionResult
 
 	retries := s.RetryCount
+	if retries <= 0 {
+		// 未配置重试次数时保证失败（如429限流）后仍能切换到其他启用账号重试。
+		retries = 3
+	}
 	if retries > 8 {
 		retries = 8
 	}
@@ -117,9 +139,13 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 	}
 
 	var lastErr error
+	tried := map[string]bool{} // 本次请求中已失败过的账号，换号重试时跳过
 	for attempt := 0; attempt <= retries; attempt++ {
-		acct := pickAPIAccount()
+		acct := pickAPIAccount(tried)
 		if acct == nil {
+			if len(tried) > 0 {
+				return res, &CompletionError{StatusCode: res.StatusCode, Err: fmt.Errorf("所有可用账号均请求失败（已尝试 %d 个），最后错误: %w", len(tried), lastErr)}
+			}
 			return res, fmt.Errorf("号池中没有可用账号")
 		}
 		email := acct.Email
@@ -130,6 +156,7 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		if !lease.ready {
 			if err := client.WarmUp(); err != nil {
 				lastErr = err
+				tried[email] = true
 				slog.Warn("[API] 初始化网页会话失败，换号重试", "email", email, "err", err)
 				lease.Unlock()
 				continue
@@ -144,6 +171,7 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			info, err := client.GetUserInfo()
 			if err != nil {
 				lastErr = err
+				tried[email] = true
 				slog.Warn("[API] 查询账号信息失败，换号重试", "email", email, "err", err)
 				lease.Unlock()
 				continue
@@ -174,12 +202,13 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		convID, err := client.CreateConversation(model, think)
 		if err != nil {
 			lastErr = err
+			tried[email] = true
 			if s.RemoveInvalidAccount && strings.Contains(err.Error(), "account_session_invalid") {
 				repository.DeleteAccount(email)
 				slog.Warn("[API] 会话失效，已立即移除账号", "email", email)
 			} else {
-				// 请求失败自动禁用：限流进入冷却倒计时（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
-				HandleRequestFailure(email, err, 0)
+				// 请求失败自动禁用：限流（含建会话阶段的 HTTP 429）进入冷却倒计时（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
+				HandleRequestFailure(email, err, httpStatusOfErr(err))
 			}
 			slog.Warn("[API] 建会话失败，切换账号重试", "email", email, "err", err)
 			lease.Unlock()
@@ -212,8 +241,12 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			return res, nil
 		}
 		lastErr = err
+		tried[email] = true
 		// 请求失败自动禁用：限流（429 或 rate limit exceeded）进入冷却倒计时，其他错误禁用且不自动恢复。
-		HandleRequestFailure(email, err, code)
+		// 2xx 属流式输出中的偶发错误，不据此禁用账号，仅换号重试。
+		if code < 200 || code > 299 {
+			HandleRequestFailure(email, err, code)
+		}
 		if emitted {
 			slog.Warn("[API] 流式输出中途失败，已输出部分内容，不再重试", "email", email, "err", err)
 			return res, &CompletionError{StatusCode: code, Err: fmt.Errorf("流式输出中断: %w", err)}
