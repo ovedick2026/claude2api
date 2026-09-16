@@ -154,6 +154,61 @@ func AdminDeleteExpired(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"removed": len(emails), "emails": emails})
 }
 
+// AdminSetAccountsStatus 批量启用/禁用账号（emails 数组，单个与批量统一处理）。
+func AdminSetAccountsStatus(c *gin.Context) {
+	var body struct {
+		Emails []string `json:"emails"`
+		Status string   `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误"})
+		return
+	}
+	status := strings.TrimSpace(body.Status)
+	if status != repository.StatusActive && status != repository.StatusDisabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "status 仅支持 active 或 disabled"})
+		return
+	}
+	updated := make([]string, 0, len(body.Emails))
+	for _, email := range body.Emails {
+		email = strings.TrimSpace(email)
+		if email == "" {
+			continue
+		}
+		if repository.UpdateAccount(email, func(a *repository.Account) {
+			a.Status = status
+			a.DisabledUntil = nil
+			a.DisableReason = ""
+		}) {
+			updated = append(updated, email)
+		}
+	}
+	action := "启用"
+	if status == repository.StatusDisabled {
+		action = "禁用"
+	}
+	slog.Info("[账号] 批量设置账号状态", "action", action, "count", len(updated))
+	c.JSON(http.StatusOK, gin.H{"updated": updated, "action": action})
+}
+
+// AdminDeleteAccounts 批量删除指定邮箱的账号。
+func AdminDeleteAccounts(c *gin.Context) {
+	var body struct {
+		Emails []string `json:"emails"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求格式错误"})
+		return
+	}
+	if len(body.Emails) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择要删除的账号"})
+		return
+	}
+	removed := repository.DeleteAccounts(body.Emails)
+	slog.Info("[删除] 批量删除账号", "count", len(removed))
+	c.JSON(http.StatusOK, gin.H{"removed": len(removed), "emails": removed})
+}
+
 func AdminListKeys(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"keys": repository.ListAPIKeys()})
 }

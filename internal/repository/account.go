@@ -96,3 +96,17 @@ func DeleteAccountsByStatus(statuses []string) []string {
 	}
 	return removed
 }
+
+// DeleteAccounts 批量删除指定邮箱的账号，返回成功删除的邮箱。
+func DeleteAccounts(emails []string) []string {
+	removed := make([]string, 0)
+	for _, email := range emails {
+		if email == "" {
+			continue
+		}
+		if db.Where("email = ?", email).Delete(&Account{}).Error == nil {
+			removed = append(removed, email)
+		}
+	}
+	return removed
+}

@@ -233,6 +233,59 @@ function fmtSurvived(t) {
   return `${sec} 秒`;
 }
 
+const selectedEmails = new Set();
+
+function pruneSelected() {
+  const live = new Set(ACCOUNTS.map((a) => a.email));
+  for (const e of [...selectedEmails]) if (!live.has(e)) selectedEmails.delete(e);
+}
+
+function updateSelAll() {
+  const boxes = [...$("#acc-body").querySelectorAll(".row-check")];
+  const all = $("#sel-all");
+  all.checked = boxes.length > 0 && boxes.every((b) => b.checked);
+  all.indeterminate = !all.checked && boxes.some((b) => b.checked);
+}
+
+function updateBatchInfo() {
+  const n = selectedEmails.size;
+  $("#batch-info").textContent = n ? `已选 ${n} 个账号` : "";
+}
+
+async function setAccountStatus(emails, status) {
+  if (!emails.length) {
+    showMsg("请先勾选要操作的账号", "err");
+    return;
+  }
+  try {
+    const data = await api("/api/accounts/status", "POST", { emails, status });
+    await loadAccounts();
+    showMsg(`已${data.action} ${data.updated.length} 个账号`, "ok");
+  } catch (e) {
+    showMsg("操作失败: " + e.message, "err");
+  }
+}
+
+async function batchDeleteSelected() {
+  const emails = [...selectedEmails];
+  if (!emails.length) {
+    showMsg("请先勾选要删除的账号", "err");
+    return;
+  }
+  const ok = await confirmDialog(
+    `确认删除选中的 ${emails.length} 个账号？此操作不可撤销。`,
+    { title: "批量删除账号" },
+  );
+  if (!ok) return;
+  try {
+    const data = await api("/api/delete-batch", "POST", { emails });
+    await loadAccounts();
+    showMsg(`已删除 ${data.removed} 个账号`, "ok");
+  } catch (e) {
+    showMsg("删除失败: " + e.message, "err");
+  }
+}
+
 function filteredAccounts() {
   const kw = searchKw.trim().toLowerCase();
   return ACCOUNTS.filter((a) => {
@@ -250,13 +303,17 @@ function renderTable() {
   const rows = filteredAccounts();
 
   if (!ACCOUNTS.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">暂无账号</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" class="empty">暂无账号</td></tr>`;
     $("#pager").innerHTML = "";
+    updateSelAll();
+    updateBatchInfo();
     return;
   }
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">没有符合条件的账号</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" class="empty">没有符合条件的账号</td></tr>`;
     $("#pager").innerHTML = "";
+    updateSelAll();
+    updateBatchInfo();
     return;
   }
 
@@ -267,6 +324,7 @@ function renderTable() {
 
   body.innerHTML = pageRows
     .map((a, i) => `<tr data-email="${esc(a.email)}">
+      <td class="col-check"><input type="checkbox" class="row-check" data-email="${esc(a.email)}"${selectedEmails.has(a.email) ? " checked" : ""} /></td>
       <td>${start + i + 1}</td>
       <td class="mono">${esc(a.email)}</td>
       <td>${statusCell(a)}</td>
@@ -276,11 +334,14 @@ function renderTable() {
       <td>
         <button class="btn-sm act-refresh">刷新</button>
         <button class="btn-sm act-detail">详情</button>
+        <button class="btn-sm act-toggle" data-mode="${statusOf(a) === "disabled" ? "enable" : "disable"}">${statusOf(a) === "disabled" ? "启用" : "禁用"}</button>
         <button class="btn-sm btn-danger act-del">删除</button>
       </td>
     </tr>`)
     .join("");
 
+  updateSelAll();
+  updateBatchInfo();
   renderPager(rows.length, totalPages);
 }
 
@@ -325,6 +386,7 @@ async function loadAccounts() {
   try {
     const data = await api("/api/accounts");
     ACCOUNTS = data.accounts || [];
+    pruneSelected();
     rerender();
   } catch (e) {
     showMsg("加载账号失败: " + e.message, "err");
@@ -1189,7 +1251,41 @@ $("#acc-body").addEventListener("click", (e) => {
     refreshAccount(email, e.target);
   else if (e.target.classList.contains("act-detail")) openDetail(email);
   else if (e.target.classList.contains("act-del")) deleteOne(email);
+  else if (e.target.classList.contains("act-toggle"))
+    setAccountStatus(
+      [email],
+      e.target.dataset.mode === "disable" ? "disabled" : "active",
+    );
 });
+
+$("#acc-body").addEventListener("change", (e) => {
+  const cb = e.target.closest(".row-check");
+  if (!cb) return;
+  if (cb.checked) selectedEmails.add(cb.dataset.email);
+  else selectedEmails.delete(cb.dataset.email);
+  updateSelAll();
+  updateBatchInfo();
+});
+
+$("#sel-all").addEventListener("change", (e) => {
+  const on = e.target.checked;
+  $("#acc-body")
+    .querySelectorAll(".row-check")
+    .forEach((cb) => {
+      cb.checked = on;
+      if (on) selectedEmails.add(cb.dataset.email);
+      else selectedEmails.delete(cb.dataset.email);
+    });
+  updateBatchInfo();
+});
+
+$("#btn-batch-enable").addEventListener("click", () =>
+  setAccountStatus([...selectedEmails], "active"),
+);
+$("#btn-batch-disable").addEventListener("click", () =>
+  setAccountStatus([...selectedEmails], "disabled"),
+);
+$("#btn-batch-delete").addEventListener("click", batchDeleteSelected);
 
 initPool($("#page-pool"));
 if (currentRole !== "admin") {

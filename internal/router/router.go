@@ -31,6 +31,8 @@ func NewMainEngine() *gin.Engine {
 	admin.POST("/config", handler.AdminUpdateConfig)
 	admin.POST("/delete", handler.AdminDeleteAccount)
 	admin.POST("/delete-expired", handler.AdminDeleteExpired)
+	admin.POST("/delete-batch", handler.AdminDeleteAccounts)
+	admin.POST("/accounts/status", handler.AdminSetAccountsStatus)
 
 	admin.GET("/keys", handler.AdminListKeys)
 	admin.POST("/keys", handler.AdminCreateKey)

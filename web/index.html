@@ -110,6 +110,10 @@
             <button id="btn-refresh-all" class="btn">一键刷新</button>
             <button id="btn-import" class="btn">批量导入</button>
             <button id="btn-del-expired" class="btn">删除失效</button>
+            <button id="btn-batch-enable" class="btn">批量启用</button>
+            <button id="btn-batch-disable" class="btn">批量禁用</button>
+            <button id="btn-batch-delete" class="btn btn-danger-solid">批量删除</button>
+            <span id="batch-info" class="batch-info"></span>
           </div>
           <div id="refresh-all-progress" class="task-progress hidden">
             <div><span>正在刷新账号</span><span class="task-progress-text"></span></div>
@@ -157,6 +161,7 @@
             <table class="acc-table">
               <thead>
                 <tr>
+                  <th class="col-check"><input type="checkbox" id="sel-all" title="全选本页" /></th>
                   <th class="col-idx">#</th>
                   <th>邮箱</th>
                   <th>状态</th>

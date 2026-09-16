@@ -2022,3 +2022,14 @@ body[data-page="login"] .err {
 #pool-key-mask .modal {
   max-width: 380px;
 }
+
+.col-check {
+  width: 36px;
+  text-align: center;
+}
+
+.batch-info {
+  font-size: 13px;
+  color: #64748b;
+  align-self: center;
+}
