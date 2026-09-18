@@ -239,12 +239,16 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		if err != nil {
 			lastErr = err
 			tried[email] = true
-			if s.RemoveInvalidAccount && strings.Contains(err.Error(), "account_session_invalid") {
-				repository.DeleteAccount(email)
-				slog.Warn("[API] 会话失效，已立即移除账号", "email", email)
-			} else {
-				// 请求失败自动禁用：限流（含建会话阶段的 HTTP 429）进入冷却倒计时（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
-				HandleRequestFailure(email, err, httpStatusOfErr(err))
+			// claude-opus-5 请求失败不禁用/冷却账号（含会话失效也不删除，仅换号重试）：
+			// 其额度治理走模型级调度过滤（每账号每日3次，次日0点自动恢复），不影响账号整体可用性。
+			if model != "claude-opus-5" {
+				if s.RemoveInvalidAccount && strings.Contains(err.Error(), "account_session_invalid") {
+					repository.DeleteAccount(email)
+					slog.Warn("[API] 会话失效，已立即移除账号", "email", email)
+				} else {
+					// 请求失败自动禁用：限流（含建会话阶段的 HTTP 429）进入冷却倒计时（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
+					HandleRequestFailure(email, err, httpStatusOfErr(err))
+				}
 			}
 			slog.Warn("[API] 建会话失败，切换账号重试", "email", email, "err", err)
 			lease.Unlock()
@@ -284,7 +288,8 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		tried[email] = true
 		// 请求失败自动禁用：限流（429 或 rate limit exceeded）进入冷却倒计时，其他错误禁用且不自动恢复。
 		// 2xx 属流式输出中的偶发错误，不据此禁用账号，仅换号重试。
-		if code < 200 || code > 299 {
+		// claude-opus-5 请求失败不禁用/冷却账号（额度用尽走模型级调度过滤，次日0点自动恢复），仅换号重试。
+		if model != "claude-opus-5" && (code < 200 || code > 299) {
 			HandleRequestFailure(email, err, code)
 		}
 		if emitted {
