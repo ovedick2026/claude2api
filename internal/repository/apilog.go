@@ -79,3 +79,24 @@ func TrimAPILogs(keep int) int64 {
 	}
 	return db.Where("id <= ?", cutoff.ID).Delete(&APILog{}).RowsAffected
 }
+
+// SumTokenUsage 汇总指定账号自 sinceUTC（含）以来成功请求的输入/输出 token 用量。
+// 数据来源为本地 APILog 调用日志（仅统计成功请求），created_at 为 UTC ISO 格式字符串，
+// 字典序与时间序一致，可直接做字符串比较，供 5 小时/7 天额度显示使用。
+func SumTokenUsage(email, sinceUTC string) (input, output int) {
+	if db == nil || email == "" {
+		return 0, 0
+	}
+	var row struct {
+		In  int64 `gorm:"column:in_tok"`
+		Out int64 `gorm:"column:out_tok"`
+	}
+	err := db.Model(&APILog{}).
+		Select("COALESCE(SUM(input_tokens),0) AS in_tok, COALESCE(SUM(output_tokens),0) AS out_tok").
+		Where("account = ? AND success = ? AND created_at >= ?", email, true, sinceUTC).
+		Scan(&row).Error
+	if err != nil {
+		return 0, 0
+	}
+	return int(row.In), int(row.Out)
+}

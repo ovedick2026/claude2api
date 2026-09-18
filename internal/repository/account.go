@@ -24,6 +24,8 @@ type Account struct {
 	Status        string            `json:"status,omitempty"`         // active/expired/error/cooldown/disabled
 	DisabledUntil *time.Time        `json:"disabled_until"`           // 限流冷却截止时间（上游 resetsAt），nil 表示无冷却
 	DisableReason string            `json:"disable_reason,omitempty"` // 自动禁用原因：限流为 "rate_limit"，其他为原始错误摘要
+	Opus5Date     string            `json:"opus5_date"`               // claude-opus-5 当日额度计数日期（本地自然日 YYYY-MM-DD，0点重置）
+	Opus5Count    int               `json:"opus5_count"`              // claude-opus-5 当日已成功调用次数
 	CreatedAt     time.Time         `json:"created_at"`
 	UpdatedAt     time.Time         `json:"updated_at"`
 }
@@ -109,4 +111,63 @@ func DeleteAccounts(emails []string) []string {
 		}
 	}
 	return removed
+}
+
+// Opus5DailyLimit claude-opus-5 每账号每日调用上限。
+const Opus5DailyLimit = 3
+
+// opus5Today 返回本地自然日日期串（YYYY-MM-DD，自然日0点重置）。
+func opus5Today() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// Opus5QuotaExhausted 判断账号当日 claude-opus-5 额度是否已用完（记录日期非当日视为未使用）。
+func (a *Account) Opus5QuotaExhausted() bool {
+	if a == nil {
+		return false
+	}
+	count := a.Opus5Count
+	if a.Opus5Date != opus5Today() {
+		count = 0
+	}
+	return count >= Opus5DailyLimit
+}
+
+// IncrOpus5Usage 记录一次 claude-opus-5 成功调用（自然日0点重置计数，随账号持久化）。
+func IncrOpus5Usage(email string) {
+	if email == "" {
+		return
+	}
+	UpdateAccount(email, func(a *Account) {
+		today := opus5Today()
+		if a.Opus5Date != today {
+			a.Opus5Date = today
+			a.Opus5Count = 0
+		}
+		a.Opus5Count++
+	})
+}
+
+// Opus5CountToday 返回账号当日已用 claude-opus-5 次数（记录日期非当日按0计）。
+func Opus5CountToday(email string) int {
+	a := AccountByEmail(email)
+	if a == nil || a.Opus5Date != opus5Today() {
+		return 0
+	}
+	return a.Opus5Count
+}
+
+// Opus5Remaining 返回账号当日 claude-opus-5 剩余可用次数（记录日期非当日视为未使用，按满额计）。
+func (a *Account) Opus5Remaining() int {
+	if a == nil {
+		return 0
+	}
+	n := Opus5DailyLimit
+	if a.Opus5Date == opus5Today() {
+		n -= a.Opus5Count
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n
 }

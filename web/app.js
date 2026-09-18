@@ -200,6 +200,39 @@ function fmtCountdown(t) {
   return `${s}秒`;
 }
 
+function fmtTokens(n) {
+  n = Number(n) || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+  return String(n);
+}
+
+function usageDetailText(u, limit) {
+  const inTok = (u && u.input_tokens) || 0;
+  const outTok = (u && u.output_tokens) || 0;
+  return `输入 ${inTok} + 输出 ${outTok} / ${limit} tokens（仅显示，不影响冷却）`;
+}
+
+function usageCell(u, limit) {
+  const inTok = (u && u.input_tokens) || 0;
+  const outTok = (u && u.output_tokens) || 0;
+  const total = inTok + outTok;
+  const pct = limit > 0 ? Math.min(100, Math.round((total / limit) * 100)) : 0;
+  return (
+    `<div class="usage-bar" title="${esc(usageDetailText(u, limit))}">` +
+    `<div class="usage-bar-fill" style="width:${pct}%"></div>` +
+    `<span class="usage-txt">${fmtTokens(total)} / ${fmtTokens(limit)}</span>` +
+    `</div>`
+  );
+}
+
+function opus5Cell(a) {
+  const limit = Number(a.opus5_limit ?? 0);
+  if (!limit) return "—";
+  const rem = Math.max(0, Number(a.opus5_remaining ?? limit));
+  return `剩余${rem}/${limit}`;
+}
+
 function statusCell(a) {
   let html = statusBadge(a.status);
   if (statusOf(a) === "cooldown" && a.disabled_until) {
@@ -303,14 +336,14 @@ function renderTable() {
   const rows = filteredAccounts();
 
   if (!ACCOUNTS.length) {
-    body.innerHTML = `<tr><td colspan="8" class="empty">暂无账号</td></tr>`;
+    body.innerHTML = `<tr><td colspan="10" class="empty">暂无账号</td></tr>`;
     $("#pager").innerHTML = "";
     updateSelAll();
     updateBatchInfo();
     return;
   }
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="8" class="empty">没有符合条件的账号</td></tr>`;
+    body.innerHTML = `<tr><td colspan="10" class="empty">没有符合条件的账号</td></tr>`;
     $("#pager").innerHTML = "";
     updateSelAll();
     updateBatchInfo();
@@ -331,6 +364,9 @@ function renderTable() {
       <td class="mono">${esc(fmtTime(a.created_at) || "—")}</td>
       <td>${esc(fmtSurvived(a.created_at))}</td>
       <td class="mono">${esc(fmtTime(a.updated_at) || "—")}</td>
+      <td class="mono">${opus5Cell(a)}</td>
+      <td>${usageCell(a.usage_5h, 100000)}</td>
+      <td>${usageCell(a.usage_7d, 500000)}</td>
       <td>
         <button class="btn-sm act-refresh">刷新</button>
         <button class="btn-sm act-detail">详情</button>
@@ -578,10 +614,18 @@ function openDetail(email) {
         ]
       : null,
     ["禁用原因", reasonText],
+    ["5小时用量", usageDetailText(a.usage_5h, 100000)],
+    ["7天用量", usageDetailText(a.usage_7d, 500000)],
     ["组织 UUID", a.org_uuid || "—"],
     ["创建时间", fmtTime(a.created_at) || "—"],
     ["已存活", fmtSurvived(a.created_at)],
     ["更新时间", fmtTime(a.updated_at) || "—"],
+    a.opus5_limit
+      ? [
+          "Opus-5 剩余额度",
+          `剩余${Math.max(0, Number(a.opus5_remaining ?? a.opus5_limit))}/${a.opus5_limit}（每账号每日${a.opus5_limit}次，次日0点恢复）`,
+        ]
+      : null,
   ].filter(Boolean);
 
   const info = rows
@@ -880,7 +924,7 @@ async function loadLogs() {
     const avgTPS = logs.length ? logs.reduce((n, l) => n + (l.tps || 0), 0) / logs.length : 0;
     $("#logs-stats").innerHTML = `<span><small>调用</small><b>${logsTotal}</b></span><span><small>成功</small><b>${success}/${logs.length}</b></span><span><small>TPS</small><b>${avgTPS.toFixed(1)}</b></span>`;
     if (!logs.length) {
-      body.innerHTML = `<tr><td colspan="8" class="empty">暂无调用日志</td></tr>`;
+      body.innerHTML = `<tr><td colspan="9" class="empty">暂无调用日志</td></tr>`;
       updateLogSelection();
       renderLogsPager();
       return;
@@ -905,7 +949,7 @@ async function loadLogs() {
     updateLogSelection();
     renderLogsPager();
   } catch (e) {
-    body.innerHTML = `<tr><td colspan="8" class="empty">加载失败：${esc(e.message)}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="empty">加载失败：${esc(e.message)}</td></tr>`;
     updateLogSelection();
   }
 }

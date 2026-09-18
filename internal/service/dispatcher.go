@@ -13,7 +13,8 @@ import (
 )
 
 var (
-	stickyEmail  string // 粘性调度：当前持续使用的账号邮箱，直至其限流或报错不可用才切换下一个
+	stickyEmail      string // 粘性调度：当前持续使用的账号邮箱，直至其限流或报错不可用才切换下一个
+	opus5StickyEmail string // claude-opus-5 专用粘性游标：模型级额度独立调度，不影响其他模型的粘性账号
 	apiIndexLock sync.Mutex
 	apiClients   = map[string]*accountClient{}
 )
@@ -40,7 +41,9 @@ func clientFor(acct *repository.Account, proxy string) *accountClient {
 
 // pickAPIAccount 依次使用（粘性调度）：按固定顺序持续使用当前账号，直至其限流或报错不可用，再切换到顺序中的下一个可用账号并循环。
 // exclude 为本次请求内已失败过的账号，确保失败（如429限流）后必定切换到下一个账号。
-func pickAPIAccount(exclude map[string]bool) *repository.Account {
+// model 用于模型级额度过滤（claude-opus-5 每日3次），模型级额度使用独立粘性游标，不影响其他模型的粘性调度。
+func pickAPIAccount(exclude map[string]bool, model string) *repository.Account {
+	opusQuota := model == "claude-opus-5"
 	accounts := repository.LoadAccounts()
 	byEmail := make(map[string]repository.Account, len(accounts))
 	order := make([]string, 0, len(accounts))
@@ -59,20 +62,36 @@ func pickAPIAccount(exclude map[string]bool) *repository.Account {
 			delete(apiClients, email)
 		}
 	}
+	// 模型级额度过滤：claude-opus-5 当日额度用完的账号不再服务该模型（次日0点自动恢复）。
+	if opusQuota {
+		for email := range byEmail {
+			if acct := byEmail[email]; usable[email] && acct.Opus5QuotaExhausted() {
+				usable[email] = false
+			}
+		}
+	}
+	sticky := stickyEmail
+	if opusQuota {
+		sticky = opus5StickyEmail
+	}
 	if len(usable) == 0 {
-		stickyEmail = ""
+		if opusQuota {
+			opus5StickyEmail = ""
+		} else {
+			stickyEmail = ""
+		}
 		return nil
 	}
 	// 当前账号仍可用：继续粘性使用，不轮询。
-	if stickyEmail != "" && usable[stickyEmail] && !exclude[stickyEmail] {
-		acct := byEmail[stickyEmail]
+	if sticky != "" && usable[sticky] && !exclude[sticky] {
+		acct := byEmail[sticky]
 		return &acct
 	}
 	// 从上一个使用位置的下一个开始，按固定顺序找第一个可用账号（到尾部则循环回开头）。
 	start := 0
-	if stickyEmail != "" {
+	if sticky != "" {
 		for i, email := range order {
-			if email == stickyEmail {
+			if email == sticky {
 				start = i + 1
 				break
 			}
@@ -81,15 +100,23 @@ func pickAPIAccount(exclude map[string]bool) *repository.Account {
 	for off := 0; off < len(order); off++ {
 		email := order[(start+off)%len(order)]
 		if usable[email] && !exclude[email] {
-			if stickyEmail != "" {
-				slog.Info("[API] 当前账号不可用，切换到下一个账号", "from", stickyEmail, "to", email)
+			if sticky != "" {
+				slog.Info("[API] 当前账号不可用，切换到下一个账号", "from", sticky, "to", email)
 			}
-			stickyEmail = email
+			if opusQuota {
+				opus5StickyEmail = email
+			} else {
+				stickyEmail = email
+			}
 			acct := byEmail[email]
 			return &acct
 		}
 	}
-	stickyEmail = ""
+	if opusQuota {
+		opus5StickyEmail = ""
+	} else {
+		stickyEmail = ""
+	}
 	return nil
 }
 
@@ -138,13 +165,25 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		}
 	}
 
+	// 归一化模型名（剥离 -thinking 后缀），供模型级额度过滤与上游请求使用。
+	think := strings.HasSuffix(reqModel, "-thinking")
+	model := strings.TrimSuffix(reqModel, "-thinking")
+
 	var lastErr error
 	tried := map[string]bool{} // 本次请求中已失败过的账号，换号重试时跳过
 	for attempt := 0; attempt <= retries; attempt++ {
-		acct := pickAPIAccount(tried)
+		acct := pickAPIAccount(tried, model)
 		if acct == nil {
 			if len(tried) > 0 {
 				return res, &CompletionError{StatusCode: res.StatusCode, Err: fmt.Errorf("所有可用账号均请求失败（已尝试 %d 个），最后错误: %w", len(tried), lastErr)}
+			}
+			if model == "claude-opus-5" {
+				accounts := repository.LoadAccounts()
+				for i := range accounts {
+					if AccountUsable(&accounts[i]) {
+						return res, &CompletionError{StatusCode: 429, Err: fmt.Errorf("所有账号的 claude-opus-5 今日额度已用完（每账号每日3次），次日0点自动恢复")}
+					}
+				}
 			}
 			return res, fmt.Errorf("号池中没有可用账号")
 		}
@@ -163,9 +202,6 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			}
 			lease.ready = true
 		}
-
-		think := strings.HasSuffix(reqModel, "-thinking")
-		model := strings.TrimSuffix(reqModel, "-thinking")
 
 		if acct.OrgUUID == "" {
 			info, err := client.GetUserInfo()
@@ -237,6 +273,10 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		}
 		lease.Unlock()
 		if err == nil {
+			// claude-opus-5 每账号每日3次额度（自然日0点重置）：成功调用后计数并随账号持久化。
+			if model == "claude-opus-5" {
+				repository.IncrOpus5Usage(email)
+			}
 			slog.Info("[API] 完成一次对话", "email", email, "model", reqModel)
 			return res, nil
 		}

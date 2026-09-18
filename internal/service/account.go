@@ -12,16 +12,26 @@ import (
 	"claude2api/internal/utils"
 )
 
+// UsageWindow 是一个统计窗口内的 token 用量（输入+输出，仅作展示，不影响调度与冷却逻辑）。
+type UsageWindow struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
 // PublicAccount 是前端账号视图。
 type PublicAccount struct {
-	Email         string     `json:"email"`
-	OrgUUID       string     `json:"org_uuid"`
-	Status        string     `json:"status,omitempty"`
-	DisabledUntil *time.Time `json:"disabled_until"`           // 限流冷却截止时间，nil 表示无冷却
-	DisableReason string     `json:"disable_reason,omitempty"` // 自动禁用原因：rate_limit=限流冷却，其他为错误摘要
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	HasSession    bool       `json:"has_session"`
+	Email         string      `json:"email"`
+	OrgUUID       string      `json:"org_uuid"`
+	Status        string      `json:"status,omitempty"`
+	DisabledUntil *time.Time  `json:"disabled_until"`           // 限流冷却截止时间，nil 表示无冷却
+	DisableReason string      `json:"disable_reason,omitempty"` // 自动禁用原因：rate_limit=限流冷却，其他为错误摘要
+	CreatedAt     time.Time   `json:"created_at"`
+	UpdatedAt     time.Time   `json:"updated_at"`
+	HasSession    bool        `json:"has_session"`
+	Usage5h       UsageWindow `json:"usage_5h"` // 5小时窗口用量（本地调用日志统计，仅显示）
+	Usage7d       UsageWindow `json:"usage_7d"` // 7天窗口用量（本地调用日志统计，仅显示）
+	Opus5Remaining int `json:"opus5_remaining"` // claude-opus-5 当日剩余次数（每账号每日3次，自然日0点重置，仅显示）
+	Opus5Limit     int `json:"opus5_limit"`
 }
 
 func SessionKey(account *repository.Account) string {
@@ -169,6 +179,12 @@ func PublicAccountView(account *repository.Account) *PublicAccount {
 	if account == nil {
 		return nil
 	}
+	// 用量窗口仅用于前端展示（本地调用日志统计），不影响调度与冷却逻辑。
+	now := time.Now().UTC()
+	since5h := now.Add(-5 * time.Hour).Format("2006-01-02T15:04:05Z")
+	since7d := now.Add(-7 * 24 * time.Hour).Format("2006-01-02T15:04:05Z")
+	in5, out5 := repository.SumTokenUsage(account.Email, since5h)
+	in7, out7 := repository.SumTokenUsage(account.Email, since7d)
 	return &PublicAccount{
 		Email:         account.Email,
 		OrgUUID:       account.OrgUUID,
@@ -178,6 +194,10 @@ func PublicAccountView(account *repository.Account) *PublicAccount {
 		CreatedAt:     account.CreatedAt,
 		UpdatedAt:     account.UpdatedAt,
 		HasSession:    SessionKey(account) != "",
+		Opus5Remaining: account.Opus5Remaining(),
+		Opus5Limit:     repository.Opus5DailyLimit,
+		Usage5h:       UsageWindow{InputTokens: in5, OutputTokens: out5},
+		Usage7d:       UsageWindow{InputTokens: in7, OutputTokens: out7},
 	}
 }
 
