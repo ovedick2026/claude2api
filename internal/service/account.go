@@ -248,7 +248,15 @@ func RefreshAccount(email string) (*repository.Account, bool) {
 	}
 
 	repository.UpdateAccount(account.Email, func(a *repository.Account) {
-		a.Email, a.OrgUUID, a.Status = info.Email, info.OrgUUID, "active"
+		a.Email, a.OrgUUID = info.Email, info.OrgUUID
+		// 限流冷却未到期时不覆盖状态：定时状态监控/手动刷新都会走到这里，
+		// 若无条件置为 active 会把冷却中的账号提前恢复启用，冷却倒计时被清零。
+		if a.Status == repository.StatusCooldown && a.DisabledUntil != nil && a.DisabledUntil.After(time.Now()) {
+			return
+		}
+		a.Status = "active"
+		a.DisabledUntil = nil
+		a.DisableReason = ""
 	})
 	return repository.AccountByEmail(info.Email), false
 }
