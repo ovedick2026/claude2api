@@ -4,6 +4,9 @@ web_uc_host: localhost       # Artifacts 沙箱 Host 这里反代要两个域名
 admin_password: claude2api   # 管理密码
 status_check_seconds: 21600  # 监测间隔
 retry_count: 0               # 重试次数
+# 请求排队：相邻两次上游请求开始时间的随机间隔范围（秒，0或负数=禁用排队）
+request_queue_min_seconds: 1
+request_queue_max_seconds: 5
 delete_chat: true            # 删除会话
 max_history_length: 12000    # 附件阈值
 remove_invalid_account: false # 自动移除会话失效的账号

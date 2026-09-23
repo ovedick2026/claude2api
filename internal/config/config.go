@@ -25,6 +25,8 @@ type Settings struct {
 	MaxChatHistoryLength       int    `json:"max_chat_history_length" yaml:"max_history_length"`
 	RemoveInvalidAccount       bool   `json:"remove_invalid_account" yaml:"remove_invalid_account"`
 	DetailedAPILog             bool   `json:"detailed_api_log" yaml:"detailed_api_log"`
+	RequestQueueMinSeconds   int    `json:"request_queue_min_seconds" yaml:"request_queue_min_seconds"`
+	RequestQueueMaxSeconds   int    `json:"request_queue_max_seconds" yaml:"request_queue_max_seconds"`
 }
 
 var (
@@ -53,7 +55,7 @@ func Load() {
 	}
 	configPath = filepath.Join(baseDir, "config.yaml")
 	ensureConfig(configPath)
-	current = Settings{WebHost: "127.0.0.1", WebPort: 8787, WebUCHost: "localhost", StatusCheckIntervalSeconds: 21600, ChatDelete: true, MaxChatHistoryLength: 12000}
+	current = Settings{WebHost: "127.0.0.1", WebPort: 8787, WebUCHost: "localhost", StatusCheckIntervalSeconds: 21600, ChatDelete: true, MaxChatHistoryLength: 12000, RequestQueueMinSeconds: 1, RequestQueueMaxSeconds: 5}
 	data, _ := os.ReadFile(configPath)
 	_ = yaml.Unmarshal(data, &current)
 	current.Proxy = strings.TrimSpace(current.Proxy)
@@ -134,6 +136,10 @@ func Update(patch map[string]any) Settings {
 			current.RemoveInvalidAccount = mustBool(v)
 		case "detailed_api_log":
 			current.DetailedAPILog = mustBool(v)
+		case "request_queue_min_seconds":
+			current.RequestQueueMinSeconds = mustAtoi(v)
+		case "request_queue_max_seconds":
+			current.RequestQueueMaxSeconds = mustAtoi(v)
 		}
 	}
 	writeConfig()

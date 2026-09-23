@@ -135,6 +135,24 @@ func httpStatusOfErr(err error) int {
 	return n
 }
 
+// recordAttemptFailure 换号重试路径上的每次失败补记一条失败APILog：
+// 此前 APILog 仅在 Complete 整体返回后记录一条（Account 为最后尝试的账号），
+// 中间被换掉/冷却的账号在 web 日志中无痕迹（仅控制台 slog），用户看到日志不全。
+// 429 限流路径已短路直接返回、由整体记录覆盖，故本函数仅在继续换号重试的失败点调用，避免重复记录。
+func recordAttemptFailure(model, email string, code int, reqErr error) {
+	if email == "" {
+		return
+	}
+	errText := ""
+	if reqErr != nil {
+		errText = reqErr.Error()
+	}
+	repository.InsertAPILog(repository.APILog{
+		Endpoint: "retry", Model: model, Account: email,
+		Success: false, StatusCode: code, Error: errText,
+	})
+}
+
 // delConvSem 限制后台删会话并发。
 var delConvSem = make(chan struct{}, 8)
 
@@ -142,6 +160,8 @@ var delConvSem = make(chan struct{}, 8)
 type Dispatcher struct{}
 
 func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) (CompletionResult, error) {
+	// 全局请求排队门闸：串行化所有上游请求的发起时刻，相邻请求随机间隔 [min,max] 秒（默认1-5秒，config.yaml 可配置），降低触发上游限流的概率；配置<=0时禁用排队。
+	waitRequestGate()
 	s := config.Get()
 	var res CompletionResult
 
@@ -196,6 +216,8 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			if err := client.WarmUp(); err != nil {
 				lastErr = err
 				tried[email] = true
+				// 初始化失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（非限流错误不短路）。
+				recordAttemptFailure(model, email, 0, err)
 				slog.Warn("[API] 初始化网页会话失败，换号重试", "email", email, "err", err)
 				lease.Unlock()
 				continue
@@ -208,6 +230,8 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			if err != nil {
 				lastErr = err
 				tried[email] = true
+				// 查询账号信息失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（非限流错误不短路）。
+				recordAttemptFailure(model, email, httpStatusOfErr(err), err)
 				slog.Warn("[API] 查询账号信息失败，换号重试", "email", email, "err", err)
 				lease.Unlock()
 				continue
@@ -247,9 +271,23 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 					slog.Warn("[API] 会话失效，已立即移除账号", "email", email)
 				} else {
 					// 请求失败自动禁用：限流（含建会话阶段的 HTTP 429）进入冷却倒计时（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
-					HandleRequestFailure(email, err, httpStatusOfErr(err))
+					createCode := httpStatusOfErr(err)
+					HandleRequestFailure(email, err, createCode)
+					// 冷却传染修复：限流后立即终止换号重试。上游限流常按 IP 等整体维度生效，
+					// 连环换号只会把整个号池逐个打入冷却；此时直接向客户端返回429。
+					if createCode == 429 || isRateLimitError(err) {
+						if createCode == 0 {
+							createCode = 429
+						}
+						res.StatusCode = createCode
+						slog.Warn("[API] 建会话触发限流，已冷却该账号并终止换号重试（防整池冷却传染）", "email", email)
+						lease.Unlock()
+						return res, &CompletionError{StatusCode: createCode, Err: fmt.Errorf("账号 %s 触发上游限流，已进入冷却并停止换号重试（避免整个号池被连带冷却）: %w", email, err)}
+					}
 				}
 			}
+			// 非限流失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（429限流已短路直接返回，由整体记录覆盖，不会重复）。
+			recordAttemptFailure(model, email, httpStatusOfErr(err), err)
 			slog.Warn("[API] 建会话失败，切换账号重试", "email", email, "err", err)
 			lease.Unlock()
 			continue
@@ -291,16 +329,19 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		// claude-opus-5 请求失败不禁用/冷却账号（额度用尽走模型级调度过滤，次日0点自动恢复），仅换号重试。
 		if model != "claude-opus-5" && (code < 200 || code > 299) {
 			HandleRequestFailure(email, err, code)
+			// 冷却传染修复：限流后立即终止换号重试，避免一次请求把整个号池逐个打入冷却，直接向客户端返回429。
+			if code == 429 || isRateLimitError(err) {
+				slog.Warn("[API] 上游返回 429，已冷却该账号并终止换号重试（防整池冷却传染）", "email", email)
+				return res, &CompletionError{StatusCode: 429, Err: fmt.Errorf("账号 %s 触发上游限流（429），已进入冷却并停止换号重试（避免整个号池被连带冷却）: %w", email, err)}
+			}
 		}
 		if emitted {
 			slog.Warn("[API] 流式输出中途失败，已输出部分内容，不再重试", "email", email, "err", err)
 			return res, &CompletionError{StatusCode: code, Err: fmt.Errorf("流式输出中断: %w", err)}
 		}
-		if code == 429 {
-			slog.Warn("[API] 上游返回 429", "email", email, "err", err)
-		} else {
-			slog.Warn("[API] 请求失败，换号重试", "email", email, "code", code, "err", err)
-		}
+		// 非限流失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（429限流已短路直接返回，由整体记录覆盖，不会重复）。
+		recordAttemptFailure(model, email, code, err)
+		slog.Warn("[API] 请求失败，换号重试", "email", email, "code", code, "err", err)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("请求失败")

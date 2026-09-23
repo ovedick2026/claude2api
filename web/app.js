@@ -44,6 +44,8 @@ const CONFIG_FIELDS = [
   "detailed_api_log",
   "status_check_interval_seconds",
   "remove_invalid_account",
+  "request_queue_min_seconds",
+  "request_queue_max_seconds",
 ];
 
 const CONFIG_DEFAULTS = {
@@ -53,6 +55,8 @@ const CONFIG_DEFAULTS = {
   detailed_api_log: false,
   status_check_interval_seconds: 21600,
   remove_invalid_account: false,
+  request_queue_min_seconds: 1,
+  request_queue_max_seconds: 5,
 };
 
 async function api(path, method = "GET", body = null, stream = false) {

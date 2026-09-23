@@ -494,6 +494,26 @@
                   />
                 </label>
                 <label class="field"
+                  >请求排队最小间隔（秒，0=禁用排队）
+                  <input
+                    id="cfg-request_queue_min_seconds"
+                    type="number"
+                    min="0"
+                    placeholder="1"
+                    class="inp"
+                  />
+                </label>
+                <label class="field"
+                  >请求排队最大间隔（秒）
+                  <input
+                    id="cfg-request_queue_max_seconds"
+                    type="number"
+                    min="0"
+                    placeholder="5"
+                    class="inp"
+                  />
+                </label>
+                <label class="field"
                   >超长上下文阈值（字符）
                   <input
                     id="cfg-max_chat_history_length"
