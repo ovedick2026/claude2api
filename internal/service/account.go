@@ -218,6 +218,16 @@ func StartAccountStatusMonitor() {
 			checkAccountStatuses()
 		}
 	}()
+	// 本地冷却恢复循环：每10秒扫描一次到期冷却账号并恢复 active。
+	// 纯本地数据库操作，不依赖上游接口与请求流量，
+	// 避免无流量或上游查询失败时到期账号长期停留在 cooldown 状态、
+	// 前端一直显示“冷却中 即将恢复”。
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			RecoverExpiredCooldowns()
+		}
+	}()
 }
 
 func RefreshAccount(email string) (*repository.Account, bool) {
