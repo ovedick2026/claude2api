@@ -165,14 +165,9 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 	s := config.Get()
 	var res CompletionResult
 
-	retries := s.RetryCount
-	if retries <= 0 {
-		// 未配置重试次数时保证失败（如429限流）后仍能切换到其他启用账号重试。
-		retries = 3
-	}
-	if retries > 8 {
-		retries = 8
-	}
+	// 换号重试改造（新需求四）：不再受 RetryCount 次数上限约束——单个账号遇报错（不重试）即切换号池内下一个可用账号重试同一请求，
+	// 循环直到号池无可用账号；仅当全部可用账号均试完仍失败时，才向请求方返回错误。
+	// tried 记录本次请求中已失败过的账号且单调增长、号池有限，保证换号循环必然终止；既有 429 短路直接返回逻辑保持不变。
 
 	// 已输出内容后不能换号，否则客户端会收到重复片段。
 	emitted := false
@@ -190,8 +185,8 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 	model := strings.TrimSuffix(reqModel, "-thinking")
 
 	var lastErr error
-	tried := map[string]bool{} // 本次请求中已失败过的账号，换号重试时跳过
-	for attempt := 0; attempt <= retries; attempt++ {
+	tried := map[string]bool{} // 本次请求中已失败过的账号，换号重试时跳过；号池有限且 tried 单调增长，保证换号循环必然终止
+	for {
 		acct := pickAPIAccount(tried, model)
 		if acct == nil {
 			if len(tried) > 0 {
@@ -245,8 +240,13 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		if len(prompt.Images) > 0 {
 			uploaded, err := client.UploadFile(prompt.Images)
 			if err != nil {
+				lastErr = err
+				tried[email] = true
+				// 图片上传失败（非限流报错）不再直接返回请求方：标记已试账号后切换号池内下一个可用账号重试同一请求，直到号池无可用账号才向请求方返回聚合错误（新需求四）。
+				recordAttemptFailure(model, email, httpStatusOfErr(err), err)
+				slog.Warn("[API] 图片上传失败，换号重试", "email", email, "err", err)
 				lease.Unlock()
-				return res, &CompletionError{StatusCode: 400, Err: fmt.Errorf("图片上传失败: %w", err)}
+				continue
 			}
 			files = uploaded
 		}
@@ -343,8 +343,4 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		recordAttemptFailure(model, email, code, err)
 		slog.Warn("[API] 请求失败，换号重试", "email", email, "code", code, "err", err)
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("请求失败")
-	}
-	return res, &CompletionError{StatusCode: res.StatusCode, Err: fmt.Errorf("请求失败: %w", lastErr)}
 }
