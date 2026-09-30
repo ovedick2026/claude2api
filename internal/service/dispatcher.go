@@ -15,8 +15,8 @@ import (
 var (
 	stickyEmail      string // 粘性调度：当前持续使用的账号邮箱，直至其限流或报错不可用才切换下一个
 	opus5StickyEmail string // claude-opus-5 专用粘性游标：模型级额度独立调度，不影响其他模型的粘性账号
-	apiIndexLock sync.Mutex
-	apiClients   = map[string]*accountClient{}
+	apiIndexLock     sync.Mutex
+	apiClients       = map[string]*accountClient{}
 )
 
 type accountClient struct {
@@ -135,10 +135,27 @@ func httpStatusOfErr(err error) int {
 	return n
 }
 
+// isClientParamError 判断是否为客户端参数类错误（4xx 中排除 401/403 会话失效、408 超时、429 限流）：
+// 此类错误与账号无关，换号重试无意义，应直接返回给下游，且不禁用/冷却账号。
+func isClientParamError(code int) bool {
+	return code >= 400 && code < 500 && code != 401 && code != 403 && code != 408 && code != 429
+}
+
+// aggStatusCode 聚合错误返回给下游的 HTTP 状态码：优先取最后一次上游错误文本中的真实状态码，
+// 避免所有账号都在建会话/发消息前失败时以状态码 0 返回。
+func aggStatusCode(resCode int, lastErr error) int {
+	if lastErr != nil {
+		if c := httpStatusOfErr(lastErr); c > resCode {
+			return c
+		}
+	}
+	return resCode
+}
+
 // recordAttemptFailure 换号重试路径上的每次失败补记一条失败APILog：
 // 此前 APILog 仅在 Complete 整体返回后记录一条（Account 为最后尝试的账号），
 // 中间被换掉/冷却的账号在 web 日志中无痕迹（仅控制台 slog），用户看到日志不全。
-// 429 限流路径已短路直接返回、由整体记录覆盖，故本函数仅在继续换号重试的失败点调用，避免重复记录。
+// 所有换号路径的失败点（含 429 限流换号）都调用本函数补记账号级失败日志。
 func recordAttemptFailure(model, email string, code int, reqErr error) {
 	if email == "" {
 		return
@@ -167,7 +184,7 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 
 	// 换号重试改造（新需求四）：不再受 RetryCount 次数上限约束——单个账号遇报错（不重试）即切换号池内下一个可用账号重试同一请求，
 	// 循环直到号池无可用账号；仅当全部可用账号均试完仍失败时，才向请求方返回错误。
-	// tried 记录本次请求中已失败过的账号且单调增长、号池有限，保证换号循环必然终止；既有 429 短路直接返回逻辑保持不变。
+	// tried 记录本次请求中已失败过的账号且单调增长、号池有限，保证换号循环必然终止；429 限流同样换号重试（换正常账号继续服务），仅号池无可用账号才返回错误给下游。
 
 	// 已输出内容后不能换号，否则客户端会收到重复片段。
 	emitted := false
@@ -190,7 +207,7 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		acct := pickAPIAccount(tried, model)
 		if acct == nil {
 			if len(tried) > 0 {
-				return res, &CompletionError{StatusCode: res.StatusCode, Err: fmt.Errorf("所有可用账号均请求失败（已尝试 %d 个），最后错误: %w", len(tried), lastErr)}
+				return res, &CompletionError{StatusCode: aggStatusCode(res.StatusCode, lastErr), Err: fmt.Errorf("所有可用账号均请求失败（已尝试 %d 个），最后错误: %w", len(tried), lastErr)}
 			}
 			if model == "claude-opus-5" {
 				accounts := repository.LoadAccounts()
@@ -211,7 +228,7 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			if err := client.WarmUp(); err != nil {
 				lastErr = err
 				tried[email] = true
-				// 初始化失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（非限流错误不短路）。
+				// 初始化失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹。
 				recordAttemptFailure(model, email, 0, err)
 				slog.Warn("[API] 初始化网页会话失败，换号重试", "email", email, "err", err)
 				lease.Unlock()
@@ -225,7 +242,7 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 			if err != nil {
 				lastErr = err
 				tried[email] = true
-				// 查询账号信息失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（非限流错误不短路）。
+				// 查询账号信息失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹。
 				recordAttemptFailure(model, email, httpStatusOfErr(err), err)
 				slog.Warn("[API] 查询账号信息失败，换号重试", "email", email, "err", err)
 				lease.Unlock()
@@ -263,6 +280,12 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		if err != nil {
 			lastErr = err
 			tried[email] = true
+			// 400/404/413 等客户端参数错误（非 401/403/408/429）：与账号无关，换号无意义也不禁用账号，直接返回给下游。
+			if cc := httpStatusOfErr(err); isClientParamError(cc) {
+				slog.Warn("[API] 建会话客户端参数错误，不换号直接返回", "email", email, "code", cc, "err", err)
+				lease.Unlock()
+				return res, &CompletionError{StatusCode: cc, Err: fmt.Errorf("客户端参数错误（HTTP %d），与账号无关，不换号重试: %w", cc, err)}
+			}
 			// claude-opus-5 请求失败不禁用/冷却账号（含会话失效也不删除，仅换号重试）：
 			// 其额度治理走模型级调度过滤（每账号每日3次，次日0点自动恢复），不影响账号整体可用性。
 			if model != "claude-opus-5" {
@@ -270,23 +293,12 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 					repository.DeleteAccount(email)
 					slog.Warn("[API] 会话失效，已立即移除账号", "email", email)
 				} else {
-					// 请求失败自动禁用：限流（含建会话阶段的 HTTP 429）进入冷却倒计时（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
-					createCode := httpStatusOfErr(err)
-					HandleRequestFailure(email, err, createCode)
-					// 冷却传染修复：限流后立即终止换号重试。上游限流常按 IP 等整体维度生效，
-					// 连环换号只会把整个号池逐个打入冷却；此时直接向客户端返回429。
-					if createCode == 429 || isRateLimitError(err) {
-						if createCode == 0 {
-							createCode = 429
-						}
-						res.StatusCode = createCode
-						slog.Warn("[API] 建会话触发限流，已冷却该账号并终止换号重试（防整池冷却传染）", "email", email)
-						lease.Unlock()
-						return res, &CompletionError{StatusCode: createCode, Err: fmt.Errorf("账号 %s 触发上游限流，已进入冷却并停止换号重试（避免整个号池被连带冷却）: %w", email, err)}
-					}
+					// 请求失败自动禁用：限流（含建会话阶段的 HTTP 429）按 5h/7d 双窗口规则进入对应窗口冷却（resetsAt，缺失默认1小时），其他错误禁用且不自动恢复。
+					// 限流冷却后不再直接返回下游错误，继续换下一个可用账号重试同一请求（号池无可用账号才返回错误）。
+					HandleRequestFailure(email, err, httpStatusOfErr(err))
 				}
 			}
-			// 非限流失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（429限流已短路直接返回，由整体记录覆盖，不会重复）。
+			// 失败点补记一条失败APILog，保证中间被换掉/冷却的账号在web日志中有痕迹（含 429 限流换号的账号）。
 			recordAttemptFailure(model, email, httpStatusOfErr(err), err)
 			slog.Warn("[API] 建会话失败，切换账号重试", "email", email, "err", err)
 			lease.Unlock()
@@ -328,18 +340,19 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 		// 2xx 属流式输出中的偶发错误，不据此禁用账号，仅换号重试。
 		// claude-opus-5 请求失败不禁用/冷却账号（额度用尽走模型级调度过滤，次日0点自动恢复），仅换号重试。
 		if model != "claude-opus-5" && (code < 200 || code > 299) {
-			HandleRequestFailure(email, err, code)
-			// 冷却传染修复：限流后立即终止换号重试，避免一次请求把整个号池逐个打入冷却，直接向客户端返回429。
-			if code == 429 || isRateLimitError(err) {
-				slog.Warn("[API] 上游返回 429，已冷却该账号并终止换号重试（防整池冷却传染）", "email", email)
-				return res, &CompletionError{StatusCode: 429, Err: fmt.Errorf("账号 %s 触发上游限流（429），已进入冷却并停止换号重试（避免整个号池被连带冷却）: %w", email, err)}
+			// 400/404/413 等客户端参数错误（非 401/403/408/429）：与账号无关，换号无意义也不禁用账号，直接返回给下游。
+			if isClientParamError(code) {
+				slog.Warn("[API] 客户端参数错误，不换号直接返回", "email", email, "code", code, "err", err)
+				return res, &CompletionError{StatusCode: code, Err: fmt.Errorf("客户端参数错误（HTTP %d），与账号无关，不换号重试: %w", code, err)}
 			}
+			// 限流（429/rate limit exceeded）按 5h/7d 双窗口规则冷却对应窗口后，继续换下一个可用账号重试同一请求，不再直接返回下游错误。
+			HandleRequestFailure(email, err, code)
 		}
 		if emitted {
 			slog.Warn("[API] 流式输出中途失败，已输出部分内容，不再重试", "email", email, "err", err)
 			return res, &CompletionError{StatusCode: code, Err: fmt.Errorf("流式输出中断: %w", err)}
 		}
-		// 非限流失败继续换号重试：补记一条失败APILog，保证中间被换掉的账号在web日志中有痕迹（429限流已短路直接返回，由整体记录覆盖，不会重复）。
+		// 失败点补记一条失败APILog，保证中间被换掉/冷却的账号在web日志中有痕迹（含 429 限流换号的账号）。
 		recordAttemptFailure(model, email, code, err)
 		slog.Warn("[API] 请求失败，换号重试", "email", email, "code", code, "err", err)
 	}

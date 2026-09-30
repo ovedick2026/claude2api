@@ -179,6 +179,9 @@ func AdminSetAccountsStatus(c *gin.Context) {
 			a.Status = status
 			a.DisabledUntil = nil
 			a.DisableReason = ""
+			// 手动启用/禁用同步清空双窗口冷却字段，避免残留 5h/7d 冷却导致启用后仍被判定冷却中。
+			a.Cooldown5hUntil = nil
+			a.Cooldown7dUntil = nil
 		}) {
 			updated = append(updated, email)
 		}

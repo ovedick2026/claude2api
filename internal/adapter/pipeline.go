@@ -168,6 +168,13 @@ func logCompletion(endpoint, model string, stream bool, prompt service.Prompt, o
 	if err != nil {
 		log.Error = err.Error()
 	}
+	// 双窗口额度独立记账：成功请求把本次 tokens（输入+输出）同时累加进账号 5h 与 7d 已用额度，
+	// 两个窗口各自冷却到期时各自归零、互不影响；claude-opus-5 走独立的每日次数限额，不计入双窗口 tokens 额度。
+	if err == nil && res.Account != "" && model != "claude-opus-5" {
+		repository.UpdateAccount(res.Account, func(a *repository.Account) {
+			a.AddQuotaUsed(tokenCount(prompt.Text) + outputTokens)
+		})
+	}
 	repository.InsertAPILog(log)
 }
 

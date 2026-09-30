@@ -429,7 +429,7 @@ func (claudeAI *ClaudeAI) SendMessage(convID, model string, prompt Prompt, attac
 
 	if resp.StatusCode == fhttp.StatusTooManyRequests {
 		body, _ := io.ReadAll(resp.Body)
-		return 429, fmt.Errorf("rate limit exceeded: %s", utils.Truncate(string(body), 300))
+		return 429, fmt.Errorf("rate limit exceeded: %s", utils.Truncate(string(body), 800))
 	}
 	if resp.StatusCode != fhttp.StatusOK {
 		body, readErr := io.ReadAll(resp.Body)

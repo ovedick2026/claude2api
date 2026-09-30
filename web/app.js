@@ -211,21 +211,31 @@ function fmtTokens(n) {
   return String(n);
 }
 
-function usageDetailText(u, limit) {
-  const inTok = (u && u.input_tokens) || 0;
-  const outTok = (u && u.output_tokens) || 0;
-  return `输入 ${inTok} + 输出 ${outTok} / ${limit} tokens（仅显示，不影响冷却）`;
+// cooldownWindowLabel 返回仍在冷却中的窗口标签（5h/7d，可能同时冷却），无则返回空串。
+function cooldownWindowLabel(a) {
+  const now = Date.now();
+  const w = [];
+  if (a.cooldown_5h_until && new Date(a.cooldown_5h_until).getTime() > now) w.push("5h");
+  if (a.cooldown_7d_until && new Date(a.cooldown_7d_until).getTime() > now) w.push("7d");
+  return w.join("+");
 }
 
-function usageCell(u, limit) {
-  const inTok = (u && u.input_tokens) || 0;
-  const outTok = (u && u.output_tokens) || 0;
-  const total = inTok + outTok;
-  const pct = limit > 0 ? Math.min(100, Math.round((total / limit) * 100)) : 0;
+// quotaDetailText 详情弹窗额度说明：已用/上限（双窗口独立统计，各自冷却到期归零）。
+function quotaDetailText(used, limit) {
+  used = Number(used || 0);
+  limit = Number(limit || 0);
+  return `已用 ${fmtTokens(used)} / 上限 ${fmtTokens(limit)} tokens（独立统计，冷却到期归零）`;
+}
+
+// quotaCell 表格额度单元格：进度条 + 已用/上限文案（5h 上限 200k，7d 上限 2M）。
+function quotaCell(used, limit) {
+  used = Number(used || 0);
+  limit = Number(limit || 0);
+  const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
   return (
-    `<div class="usage-bar" title="${esc(usageDetailText(u, limit))}">` +
+    `<div class="usage-bar" title="${esc(quotaDetailText(used, limit))}">` +
     `<div class="usage-bar-fill" style="width:${pct}%"></div>` +
-    `<span class="usage-txt">${fmtTokens(total)} / ${fmtTokens(limit)}</span>` +
+    `<span class="usage-txt">${fmtTokens(used)} / ${fmtTokens(limit)}</span>` +
     `</div>`
   );
 }
@@ -241,6 +251,7 @@ function statusCell(a) {
   let html = statusBadge(a.status);
   if (statusOf(a) === "cooldown" && a.disabled_until) {
     html +=
+      (cooldownWindowLabel(a) ? ` <span class="cd-win">[${esc(cooldownWindowLabel(a))}]</span>` : "") +
       ` <span class="cd-count" data-cd="${esc(a.disabled_until)}">` +
       (esc(fmtCountdown(a.disabled_until)) || "即将恢复") +
       `</span>`;
@@ -369,8 +380,8 @@ function renderTable() {
       <td>${esc(fmtSurvived(a.created_at))}</td>
       <td class="mono">${esc(fmtTime(a.updated_at) || "—")}</td>
       <td class="mono">${opus5Cell(a)}</td>
-      <td>${usageCell(a.usage_5h, 100000)}</td>
-      <td>${usageCell(a.usage_7d, 500000)}</td>
+      <td>${quotaCell(a.quota_5h, a.quota_5h_limit || 200000)}</td>
+      <td>${quotaCell(a.quota_7d, a.quota_7d_limit || 2000000)}</td>
       <td>
         <button class="btn-sm act-refresh">刷新</button>
         <button class="btn-sm act-detail">详情</button>
@@ -604,7 +615,7 @@ function openDetail(email) {
   };
   const reasonText =
     a.disable_reason === "rate_limit"
-      ? "限流冷却（到期自动恢复）"
+      ? "限流冷却（" + (cooldownWindowLabel(a) ? cooldownWindowLabel(a) + " 窗口，" : "") + "到期自动恢复）"
       : a.disable_reason
         ? "错误：" + a.disable_reason
         : "—";
@@ -617,9 +628,11 @@ function openDetail(email) {
           `${fmtTime(a.disabled_until)}（剩余 ${fmtCountdown(a.disabled_until) || "即将恢复"}）`,
         ]
       : null,
+    a.cooldown_5h_until ? ["5小时冷却截止", `${fmtTime(a.cooldown_5h_until)}（剩余 ${fmtCountdown(a.cooldown_5h_until) || "即将恢复"}）`] : null,
+    a.cooldown_7d_until ? ["7天冷却截止", `${fmtTime(a.cooldown_7d_until)}（剩余 ${fmtCountdown(a.cooldown_7d_until) || "即将恢复"}）`] : null,
     ["禁用原因", reasonText],
-    ["5小时用量", usageDetailText(a.usage_5h, 100000)],
-    ["7天用量", usageDetailText(a.usage_7d, 500000)],
+    ["5小时额度", quotaDetailText(a.quota_5h, a.quota_5h_limit || 200000)],
+    ["7天额度", quotaDetailText(a.quota_7d, a.quota_7d_limit || 2000000)],
     ["组织 UUID", a.org_uuid || "—"],
     ["创建时间", fmtTime(a.created_at) || "—"],
     ["已存活", fmtSurvived(a.created_at)],
