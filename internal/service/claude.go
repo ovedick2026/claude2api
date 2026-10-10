@@ -386,7 +386,7 @@ func (claudeAI *ClaudeAI) SendMessage(convID, model string, prompt Prompt, attac
 		"sync_sources":        []any{},
 		"rendering_mode":      "messages",
 		"timezone":            "America/Los_Angeles",
-		"effort": "extra",
+		"effort": "xhigh",
 		"thinking_mode": "auto",
 	}
 	// Claude.ai 网页端 completion 接口不接受 max_tokens 字段，
