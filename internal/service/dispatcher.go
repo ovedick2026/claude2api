@@ -45,15 +45,20 @@ func clientFor(acct *repository.Account, proxy string) *accountClient {
 func pickAPIAccount(exclude map[string]bool, model string) *repository.Account {
 	opusQuota := model == "claude-opus-5"
 	accounts := repository.LoadAccounts()
-	byEmail := make(map[string]repository.Account, len(accounts))
 	order := make([]string, 0, len(accounts))
 	usable := map[string]bool{}
 	for i := range accounts {
-		byEmail[accounts[i].Email] = accounts[i]
 		order = append(order, accounts[i].Email)
 		if AccountUsable(&accounts[i]) {
 			usable[accounts[i].Email] = true
 		}
+	}
+	// byEmail 快照必须在可用性判定之后构建：AccountUsable 对 cooldown 账号会顺带触发
+	// recoverWindowCooldowns 恢复（改库并把恢复后副本刷回 accounts[i] 元素），若先建快照，
+	// 返回给调度的是恢复前陈旧副本（status 仍 cooldown、窗口额度未重置），污染后续请求与记账。
+	byEmail := make(map[string]repository.Account, len(accounts))
+	for i := range accounts {
+		byEmail[accounts[i].Email] = accounts[i]
 	}
 	apiIndexLock.Lock()
 	defer apiIndexLock.Unlock()
@@ -205,6 +210,12 @@ func (Dispatcher) Complete(reqModel string, prompt Prompt, onText func(string)) 
 	tried := map[string]bool{} // 本次请求中已失败过的账号，换号重试时跳过；号池有限且 tried 单调增长，保证换号循环必然终止
 	for {
 		acct := pickAPIAccount(tried, model)
+		// 兜底恢复：后台恢复循环每 10 秒一轮，冷却刚到期时库内 status 仍为 cooldown，
+		// 该滞后窗口内新请求会被误判「号池中没有可用账号」。挑号失败且本次尚无已试账号时，
+		// 先同步执行一次到期冷却恢复，确有账号被恢复才重挑一次，仍无可用账号才返回错误。
+		if acct == nil && len(tried) == 0 && RecoverExpiredCooldowns() > 0 {
+			acct = pickAPIAccount(tried, model)
+		}
 		if acct == nil {
 			if len(tried) > 0 {
 				return res, &CompletionError{StatusCode: aggStatusCode(res.StatusCode, lastErr), Err: fmt.Errorf("所有可用账号均请求失败（已尝试 %d 个），最后错误: %w", len(tried), lastErr)}

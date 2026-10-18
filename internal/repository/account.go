@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"sync"
 	"time"
 
 	"gorm.io/gorm/clause"
@@ -113,8 +114,16 @@ func UpsertAccount(a *Account) error {
 	}).Create(a).Error
 }
 
+// accountWriteMu 串行化账号表读改写：UpdateAccount 为「读整行→闭包改字段→整行 Save」三段操作，
+// 无锁时并发写者（10秒冷却恢复循环、429 冷却写入、成功请求额度记账、周期刷新、管理操作）交错
+// 会用陈旧整行快照覆盖他人更新（丢失更新），例如把刚恢复 active 的账号写回 cooldown，导致
+// 调度误判号池为空。加包级互斥锁保证单账号读改写原子；mutate 闭包内不得再调用账号写函数（防死锁）。
+var accountWriteMu sync.Mutex
+
 // UpdateAccount 修改指定账号。
 func UpdateAccount(email string, mutate func(*Account)) bool {
+	accountWriteMu.Lock()
+	defer accountWriteMu.Unlock()
 	a := AccountByEmail(email)
 	if a == nil {
 		return false

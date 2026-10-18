@@ -22,6 +22,9 @@ const (
 	defaultModel    = "claude-sonnet-4-6"
 )
 
+// claude-sonnet-5-5 按普通模型接入：参与粘性调度、5h/7d token 用量统计与限流冷却，
+// 不套用 claude-opus-5 的每日3次与免冷却特殊逻辑；-thinking 变体由 ListModels 的
+// id+"-thinking" 循环统一注册，Dispatcher.Complete 统一剥离后缀映射到基础模型。
 var supportedModels = []string{defaultModel, "claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5"}
 
 type Message struct {
